@@ -1,60 +1,8 @@
 #!/usr/bin/env python3
 """
-Veracode Tenant-Wide Scan Health v3.0
-Faithful Python port of https://github.com/veracode/scan_health (Go v2.47)
+Veracode Tenant-Wide Scan Health
+Python port of https://github.com/veracode/scan_health (Go v2.47)
 Extended for tenant-wide iteration, Excel/CSV/JSON export, trend analysis.
-
-Requirements:
-    pip install veracode-api-signing requests openpyxl
-
-Auth: ~/.veracode/credentials or env vars VERACODE_API_KEY_ID / VERACODE_API_KEY_SECRET
-
-CHANGELOG (v3.0)
-=================
-DATA MODEL:
-  - Replaced all dict-based structures with @dataclass: Issue, ScanResult, ModuleRow,
-    FileRow, RecommendationRow, TrendRow
-  - Full type hints on every function signature and return type
-CHECK REFACTOR:
-  - Broke run_checks() into 31 individual check_* functions, each returning (issues, recs)
-  - Checks registered in CHECK_REGISTRY; --skip-checks N,N disables by number
-  - Implemented check #25 overScanning (dependency-of analysis from prescan is_dep)
-  - Added analysisSize check: flags analysis_size > 500MB or total module size > 1GB
-ACCURACY FIXES:
-  - Build selection: filters for latest *published* build, not blindly builds[-1]
-  - _fancy_match: audited against Go FancyList. Fixed: ! and ^ can combine; added comments
-  - Namespace stripping: count=0 strips all xmlns occurrences (was count=1)
-  - Specific exception handling: requests.HTTPError + ET.ParseError, no bare except
-  - Auth errors (401/403): detected, logged with clear message, abort
-CLI:
-  - --app-name-filter REGEX: filter apps by name regex
-  - --parallel N: concurrent ThreadPoolExecutor with delay semaphore
-  - --resume PATH: skip already-processed (App ID, Sandbox) pairs from prior xlsx
-  - --output-format {xlsx,csv,json}: multi-format output
-  - --previous-report PATH: trend analysis against prior run
-  - --dry-run: list apps then exit
-  - --log-level {DEBUG,INFO,WARNING}
-  - --timeout SECONDS: per-request timeout (default 120)
-  - --skip-checks 1,5,17: comma-separated check numbers to skip
-  - --self-test: run checks against mock fixture and verify
-EXCEL:
-  - Recommendations sheet: one row per rec per app with severity and doc URL
-  - Tenant Aggregation sheet: most common issues across all apps
-  - Summary: Selected Module Names, SCA Component Count, Scan Age Bucket,
-    Total Upload Size (MB), Health Trend columns
-  - Conditional formatting on Scan Age Bucket
-TREND ANALYSIS:
-  - --previous-report reads prior Summary sheet
-  - Trend sheet: per-app health change, flaw delta, open policy delta
-  - Summary sheet: Health Trend column
-ROBUSTNESS:
-  - 401/403 abort with clear credential message
-  - Configurable --timeout
-  - Tightened exception types on API calls
-  - --self-test mock fixture
-OUTPUT:
-  - Stdout tenant summary after report: health distribution, top 3 issues
-  - JSON structured output when --output-format json
 """
 
 from __future__ import annotations
