@@ -3,6 +3,9 @@
 Veracode Tenant-Wide Scan Health
 Python port of https://github.com/veracode/scan_health (Go v2.47)
 Extended for tenant-wide iteration, Excel/CSV/JSON export, trend analysis.
+
+Requirements:
+    pip install veracode-api-signing requests openpyxl
 """
 
 from __future__ import annotations
@@ -99,6 +102,24 @@ _AGE_CLR = {"<7d": "C6EFCE", "7-30d": "C6EFCE", "30-90d": "FFEB9C", "90d+": "FFC
 class Issue:
     severity: str
     description: str
+    check_num: int = 0
+    check_name: str = ""
+    check_num: int = 0
+    check_name: str = ""
+
+CHECK_CATEGORIES: dict[int, str] = {
+    1: "Packaging", 2: "Module Selection", 3: "Flaw Analysis",
+    4: "Fatal Errors", 5: "Fatal Errors", 6: "Packaging",
+    7: "Packaging", 8: "Packaging", 9: "SCA",
+    10: "Module Selection", 11: "Packaging", 12: "Module Quality",
+    13: "Module Quality", 14: "Fatal Errors", 15: "Module Selection",
+    16: "Security Risk", 17: "Security Risk", 18: "Packaging",
+    19: "Packaging", 20: "Packaging", 21: "Packaging",
+    22: "Packaging", 23: "Packaging", 24: "Module Selection",
+    25: "Module Selection", 26: "Module Selection", 27: "Packaging",
+    28: "Packaging", 29: "Module Selection", 30: "Scan Recency",
+    31: "Packaging",
+}
 
 @dataclass
 class FlawSummary:
@@ -194,6 +215,30 @@ class TrendRow:
                 "Flaw Delta": self.flaw_delta,
                 "Previous Open Policy": self.prev_open_pol, "Current Open Policy": self.curr_open_pol,
                 "Open Policy Delta": self.open_pol_delta}
+
+@dataclass
+class AppIssues:
+    """Carries structured issue data per app for aggregation."""
+    app_name: str = ""
+    bu: str = ""
+    policy: str = ""
+    sandbox: str = ""
+    health: str = ""
+    issues: list[Issue] = field(default_factory=list)
+    recs: list[str] = field(default_factory=list)
+
+@dataclass
+class AggIssue:
+    """Structured issue record for accurate tenant-level aggregation."""
+    app_name: str
+    bu: str
+    sandbox: str
+    check_num: int
+    check_name: str
+    category: str
+    severity: str
+    description: str
+    recommendation: str
 
 # ==========================================================================
 # Helpers
@@ -929,18 +974,26 @@ CHECK_REGISTRY: list[tuple[int, str, CheckFunc]] = [
 
 def run_checks(files: list[dict], modules: list[dict], flaws: FlawSummary,
                scan_meta: dict, sca_on: bool, sca_comps: list[str],
-               app_mod: str, skip: set[int] | None = None) -> tuple[list[Issue], list[str]]:
+               app_mod: str, skip: set[int] | None = None
+               ) -> tuple[list[Issue], list[str], dict[int, list[str]]]:
+    """Returns (all_issues, all_recs, check_recs) where check_recs maps check# to its recs."""
     all_issues: list[Issue] = []; all_recs: list[str] = []
+    check_recs: dict[int, list[str]] = {}
     for num, name, func in CHECK_REGISTRY:
         if skip and num in skip: continue
         try:
             iss, rcs = func(files, modules, flaws, scan_meta, sca_on, sca_comps, app_mod)
+            for i in iss:
+                i.check_num = num
+                i.check_name = name
             all_issues.extend(iss)
+            if rcs:
+                check_recs[num] = rcs
             for r in rcs:
                 if r not in all_recs: all_recs.append(r)
         except Exception as e:
             log.warning("Check #%d (%s) failed: %s", num, name, e)
-    return all_issues, all_recs
+    return all_issues, all_recs, check_recs
 
 
 # ==========================================================================
@@ -960,13 +1013,13 @@ def _find_latest_published_build(client: VeracodeClient, aid: int, builds: list[
 def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
                    legacy_id: int, sandbox_name: str = "",
                    skip_checks: set[int] | None = None,
-                   prev_data: dict | None = None) -> tuple[ScanResult, list[ModuleRow], list[FileRow], list[RecommendationRow], TrendRow | None]:
+                   prev_data: dict | None = None) -> tuple[ScanResult, list[ModuleRow], list[FileRow], list[RecommendationRow], list[AggIssue], TrendRow | None]:
     build = _find_latest_published_build(client, legacy_id, builds)
     if build is None:
         sr = _empty_result(app, legacy_id, sandbox_name)
         sr.issues_text = "[HIGH] No published build found"
         sr.health = "Poor"; sr.high_issues = 1; sr.total_issues = 1
-        return sr, [], [], [], None
+        return sr, [], [], [], [], None
 
     bid = build["id"]
     dr = client.get_detailed_report(bid)
@@ -994,7 +1047,7 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
     tri_url = f"{base}/auth/index.jsp#ReviewResultsStaticFlaws:{acct}:{aid_str}:{bid}:{an_id}:{sau}::::{sbx_id}" if acct else ""
 
     scan_meta = {"review_url": rev_url, "triage_url": tri_url, "analysis_size": dr.get("analysis_size",0)}
-    issues, recs = run_checks(files, modules, fl, scan_meta,
+    issues, recs, check_recs = run_checks(files, modules, fl, scan_meta,
                               dr.get("sca_on",False), dr.get("sca_comps",[]),
                               app_mod_date, skip_checks)
 
@@ -1062,13 +1115,33 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
                  ignored=f["is_ignored"], third_party=f["is_third_party"])
                  for f in files]
 
-    # Build recommendation rows
-    max_sev = "high" if hi else ("medium" if mi else "low")
-    rec_rows = [RecommendationRow(app_name=app["name"], build_id=bid,
-                severity=max_sev, recommendation=r, doc_url=_extract_url(r))
-                for r in recs]
+    # Build recommendation rows -- match each rec to the highest-severity issue it came from
+    rec_rows: list[RecommendationRow] = []
+    for r in recs:
+        # Find the most severe issue whose check produced this rec
+        best_sev = "low"
+        for i in issues:
+            if best_sev != "high" and i.severity == "high": best_sev = "high"
+            elif best_sev == "low" and i.severity == "medium": best_sev = "medium"
+        rec_rows.append(RecommendationRow(app_name=app["name"], build_id=bid,
+                    severity=best_sev, recommendation=r, doc_url=_extract_url(r)))
 
-    return sr, mod_rows, file_rows, rec_rows, trend
+    # Build structured aggregation issues (one per issue, with check metadata and matched rec)
+    sb_name = sandbox_name or dr.get("sandbox_name", "")
+    agg_issues: list[AggIssue] = []
+    for i in issues:
+        # Get the first recommendation from this specific check
+        check_rec_list = check_recs.get(i.check_num, [])
+        matched_rec = check_rec_list[0] if check_rec_list else ""
+        agg_issues.append(AggIssue(
+            app_name=app["name"], bu=app.get("bu", ""), sandbox=sb_name,
+            check_num=i.check_num, check_name=i.check_name,
+            category=CHECK_CATEGORIES.get(i.check_num, "Other"),
+            severity=i.severity, description=i.description,
+            recommendation=matched_rec,
+        ))
+
+    return sr, mod_rows, file_rows, rec_rows, agg_issues, trend
 
 
 def _empty_result(app: dict, lid: int, sandbox: str = "") -> ScanResult:
@@ -1081,25 +1154,25 @@ def _empty_result(app: dict, lid: int, sandbox: str = "") -> ScanResult:
 def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
                  skip_checks: set[int] | None, prev_data: dict | None,
                  resume_keys: set[tuple[str, str]] | None
-                 ) -> tuple[list[ScanResult], list[ModuleRow], list[FileRow], list[RecommendationRow], list[TrendRow]]:
+                 ) -> tuple[list[ScanResult], list[ModuleRow], list[FileRow], list[RecommendationRow], list[AggIssue], list[TrendRow]]:
     lid = app.get("legacy_id")
-    if not lid: return [], [], [], [], []
+    if not lid: return [], [], [], [], [], []
     rs: list[ScanResult] = []; ms: list[ModuleRow] = []; fs: list[FileRow] = []
-    rrs: list[RecommendationRow] = []; ts: list[TrendRow] = []
+    rrs: list[RecommendationRow] = []; ais: list[AggIssue] = []; ts: list[TrendRow] = []
 
     key = (app["name"], "")
     if resume_keys and key in resume_keys:
-        log.debug("    Skipping (resume): %s", app["name"]); return rs, ms, fs, rrs, ts
+        log.debug("    Skipping (resume): %s", app["name"]); return rs, ms, fs, rrs, ais, ts
 
     builds = client.get_builds(lid)
     if not builds:
-        if skip_no: return rs, ms, fs, rrs, ts
+        if skip_no: return rs, ms, fs, rrs, ais, ts
         rs.append(_empty_result(app, lid))
-        return rs, ms, fs, rrs, ts
+        return rs, ms, fs, rrs, ais, ts
 
-    sr, mr, fr, rr, tr = _process_build(client, app, builds, lid,
+    sr, mr, fr, rr, ai, tr = _process_build(client, app, builds, lid,
                                          skip_checks=skip_checks, prev_data=prev_data)
-    rs.append(sr); ms.extend(mr); fs.extend(fr); rrs.extend(rr)
+    rs.append(sr); ms.extend(mr); fs.extend(fr); rrs.extend(rr); ais.extend(ai)
     if tr: ts.append(tr)
 
     if inc_sb:
@@ -1108,12 +1181,12 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
             if resume_keys and sb_key in resume_keys: continue
             sb_builds = client.get_builds(lid, sb["id"])
             if not sb_builds: continue
-            sr2, mr2, fr2, rr2, tr2 = _process_build(client, app, sb_builds, lid, sb["name"],
+            sr2, mr2, fr2, rr2, ai2, tr2 = _process_build(client, app, sb_builds, lid, sb["name"],
                                                        skip_checks=skip_checks, prev_data=prev_data)
-            rs.append(sr2); ms.extend(mr2); fs.extend(fr2); rrs.extend(rr2)
+            rs.append(sr2); ms.extend(mr2); fs.extend(fr2); rrs.extend(rr2); ais.extend(ai2)
             if tr2: ts.append(tr2)
 
-    return rs, ms, fs, rrs, ts
+    return rs, ms, fs, rrs, ais, ts
 
 
 # ==========================================================================
@@ -1163,7 +1236,9 @@ def _load_previous(path: str) -> dict[tuple[str, str], dict]:
 
 _CW: dict[str, int] = {"App Name":30,"Issues":80,"Recommendations":80,"Module":30,
     "File":35,"Review Modules URL":50,"Triage Flaws URL":50,"Policy":25,
-    "Business Unit":20,"Selected Module Names":40,"Recommendation":60,"Doc URL":40}
+    "Business Unit":20,"Selected Module Names":40,"Recommendation":60,"Doc URL":40,
+    "Check Name":22,"Category":18,"Issue Pattern":60,"Top Recommendation":60,
+    "Affected App Names":50,"Business Units":35}
 
 def _hdr(ws: object, n: int) -> None:
     for c in range(1,n+1):
@@ -1186,37 +1261,103 @@ def _sheet(ws: object, rows: list[dict], hcol: str | None = None, age_col: str |
     ws.auto_filter.ref=ws.dimensions
 
 
-def _build_aggregation(health_rows: list[dict]) -> list[dict]:
-    """Build tenant-level aggregation of most common issues."""
-    counter: Counter[str] = Counter()
-    issue_apps: dict[str, list[str]] = {}
-    issue_sev: dict[str, str] = {}
-    issue_rec: dict[str, str] = {}
-    for r in health_rows:
-        txt = r.get("Issues","")
-        if txt == "None": continue
-        app = r.get("App Name","")
-        recs_txt = r.get("Recommendations","")
-        for part in txt.split("; "):
-            # Strip severity prefix and app-specific names for dedup
-            clean = re.sub(r'\[(?:HIGH|MEDIUM|LOW)\]\s*', '', part).strip()
-            clean = re.sub(r'"[^"]*"', '(name)', clean)
-            if not clean: continue
-            sev = "high" if "[HIGH]" in part else ("medium" if "[MEDIUM]" in part else "low")
-            counter[clean] += 1
-            issue_apps.setdefault(clean, [])
-            if app not in issue_apps[clean]: issue_apps[clean].append(app)
-            issue_sev[clean] = sev
-            if clean not in issue_rec and recs_txt != "None":
-                issue_rec[clean] = recs_txt.split("; ")[0] if recs_txt else ""
+def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict]:
+    """Build accurate tenant-level aggregation from structured AggIssue records.
+
+    Groups issues by (check_num, check_name) so each row represents one type of
+    problem across the tenant. Uses the real check metadata rather than regex
+    guesswork on serialized strings.
+
+    Output columns:
+      - Check #: the check number for reference
+      - Check Name: machine-readable check name
+      - Category: Packaging / Module Selection / Fatal Errors / etc.
+      - Severity: highest severity observed for this check across all apps
+      - Apps Affected: count of unique apps that triggered this check
+      - % of Tenant: percentage of total apps
+      - Affected App Names: comma-separated, max 10 then "and N others"
+      - Business Units Affected: unique BUs with this issue
+      - Sample Issue: one representative issue description (shortest, for clarity)
+      - Top Recommendation: the recommendation linked to this check
+    """
+    if not agg_issues:
+        return []
+
+    # Group by check number
+    by_check: dict[int, list[AggIssue]] = {}
+    for ai in agg_issues:
+        by_check.setdefault(ai.check_num, []).append(ai)
+
     rows: list[dict] = []
-    for pattern, count in counter.most_common(50):
-        apps = issue_apps.get(pattern, [])
-        app_str = ", ".join(apps[:10])
-        if len(apps) > 10: app_str += f" and {len(apps)-10} others"
-        rows.append({"Issue Pattern": pattern, "Count": count,
-                     "Severity": issue_sev.get(pattern,""), "Affected Apps": app_str,
-                     "Top Recommendation": issue_rec.get(pattern,"")})
+    for check_num in sorted(by_check.keys()):
+        group = by_check[check_num]
+        check_name = group[0].check_name
+        category = group[0].category
+
+        # Highest severity in this group
+        sevs = {ai.severity for ai in group}
+        if "high" in sevs:
+            sev = "HIGH"
+        elif "medium" in sevs:
+            sev = "MEDIUM"
+        else:
+            sev = "LOW"
+
+        # Unique apps
+        unique_apps = list(dict.fromkeys(ai.app_name for ai in group))
+        app_count = len(unique_apps)
+        pct = round(100 * app_count / total_apps, 1) if total_apps else 0
+
+        app_str = ", ".join(unique_apps[:10])
+        if len(unique_apps) > 10:
+            app_str += f" and {len(unique_apps) - 10} others"
+
+        # Unique business units with counts
+        bu_counter: Counter[str] = Counter()
+        for ai in group:
+            if ai.bu: bu_counter[ai.bu] += 1
+        bu_parts = [f"{bu} ({cnt})" for bu, cnt in bu_counter.most_common(10)]
+        bu_str = ", ".join(bu_parts)
+        if len(bu_counter) > 10:
+            bu_str += f" and {len(bu_counter) - 10} others"
+
+        # Total issue occurrences (may exceed app count when one app triggers
+        # multiple sub-issues from the same check, e.g. multiple fatal error types)
+        occurrence_count = len(group)
+
+        # Representative issue: pick the most common normalized pattern
+        pattern_counter: Counter[str] = Counter()
+        for ai in group:
+            clean = re.sub(r'"[^"]*"', '(name)', ai.description)
+            clean = re.sub(r'\b\d+\b', 'N', clean)
+            pattern_counter[clean] += 1
+        sample = pattern_counter.most_common(1)[0][0] if pattern_counter else ""
+
+        # Top recommendation: pick the first non-empty one
+        rec = ""
+        for ai in group:
+            if ai.recommendation:
+                rec = ai.recommendation
+                break
+
+        rows.append({
+            "Check #": check_num,
+            "Check Name": check_name,
+            "Category": category,
+            "Severity": sev,
+            "Apps Affected": app_count,
+            "% of Tenant": pct,
+            "Total Occurrences": occurrence_count,
+            "Affected App Names": app_str,
+            "Business Units": bu_str,
+            "Issue Pattern": sample,
+            "Top Recommendation": rec,
+        })
+
+    # Sort by severity (HIGH first), then by app count descending
+    sev_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    rows.sort(key=lambda r: (sev_order.get(r["Severity"], 3), -r["Apps Affected"]))
+
     return rows
 
 
@@ -1416,7 +1557,7 @@ def main() -> None:
 
             all_sr: list[ScanResult] = []; all_mr: list[ModuleRow] = []
             all_fr: list[FileRow] = []; all_rr: list[RecommendationRow] = []
-            all_tr: list[TrendRow] = []
+            all_ai: list[AggIssue] = []; all_tr: list[TrendRow] = []
             lock = threading.Lock()
             delay_lock = threading.Lock()
 
@@ -1424,12 +1565,12 @@ def main() -> None:
                 idx, app = idx_app
                 log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
                 try:
-                    sr, mr, fr, rr, tr = _process_app(
+                    sr, mr, fr, rr, ai, tr = _process_app(
                         client, app, args.skip_no_scan, args.include_sandboxes,
                         skip_checks, prev_data, resume_keys)
                     with lock:
                         all_sr.extend(sr); all_mr.extend(mr); all_fr.extend(fr)
-                        all_rr.extend(rr); all_tr.extend(tr)
+                        all_rr.extend(rr); all_ai.extend(ai); all_tr.extend(tr)
                     for s in sr:
                         sb = f' [{s.sandbox}]' if s.sandbox else ""
                         log.info("    %s | Issues: %d%s", s.health, s.total_issues, sb)
@@ -1461,7 +1602,7 @@ def main() -> None:
             f_rows = [f.to_row() for f in all_fr]
             r_rows = [r.to_row() for r in all_rr]
             t_rows = [t.to_row() for t in all_tr]
-            agg = _build_aggregation(h_rows)
+            agg = _build_aggregation(all_ai, len(h_rows))
 
             log.info("\n[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
                      len(h_rows), len(m_rows), len(f_rows), len(r_rows), len(t_rows))
